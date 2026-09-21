@@ -5,7 +5,7 @@
 #include "Chat.h"
 #include "ScriptMgr.h"
 #include "AuctionHouseBot.h"
-#include "../../mod-phase-progression/src/PhaseMgr.h"
+#include "AuctionHouseBotProgressionProvider.h"
 #include "Log.h"
 #include "Mail.h"
 #include "ObjectMgr.h"
@@ -145,24 +145,41 @@ public:
     void OnBeforeAuctionHouseMgrUpdate() override
     {
         /*
-         * Sincronización automática con avances y rollbacks.
+         * Synchronize the AHBot market with the external
+         * authoritative progression policy.
          */
-        if (sPhaseMgr.IsEnabled() &&
-            sPhaseMgr.IsValidPhase(
-                sPhaseMgr.GetActivePhase()))
+        AuctionHouseBotProgression::Policy phase;
+
+        if (AuctionHouseBotProgression::TryGetPolicy(
+                phase))
         {
-            uint8 currentPhase =
-                sPhaseMgr.GetActivePhase();
+            uint8 currentPhase = phase.phase;
 
             if (LastKnownPhase == 0)
             {
+                /*
+                 * Rebuild once on first authoritative policy.
+                 * This also covers startup-order cases where
+                 * AHBot built its initial pool before the
+                 * progression authority became available.
+                 *
+                 * Existing auctions are not emptied here.
+                 */
                 LastKnownPhase = currentPhase;
+
+                auctionbot->
+                    PopulateItemCandidatesAndProportions();
+
+                LOG_INFO(
+                    "module",
+                    "[AHBotPhase] Initial authoritative "
+                    "policy detected. Candidate pool "
+                    "synchronized with phase {}.",
+                    static_cast<uint32>(
+                        currentPhase));
             }
             else if (currentPhase != LastKnownPhase)
             {
-                PhaseDefinition const& phase =
-                    sPhaseMgr.GetActiveDefinition();
-
                 LOG_INFO(
                     "module",
                     "[AHBotPhase] Phase changed {} -> {}. "
@@ -177,16 +194,9 @@ public:
                         phase.maxPlayerLevel),
                     phase.auctionMaterialMaxItemLevel);
 
-                /*
-                 * Solo vacía las subastas pertenecientes
-                 * a AuctionHouseBot.
-                 */
                 auctionbot->EmptyAuctionHouses();
                 auctionbot->CleanupExpiredAuctionItems();
 
-                /*
-                 * Reconstruir candidatos usando la nueva fase.
-                 */
                 auctionbot->
                     PopulateItemCandidatesAndProportions();
 

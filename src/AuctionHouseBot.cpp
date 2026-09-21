@@ -21,7 +21,7 @@
 #include "ObjectMgr.h"
 #include "AuctionHouseMgr.h"
 #include "AuctionHouseBot.h"
-#include "../../mod-phase-progression/src/PhaseMgr.h"
+#include "AuctionHouseBotProgressionProvider.h"
 #include "AuctionHouseSearcher.h"
 #include "Config.h"
 #include "Player.h"
@@ -30,12 +30,85 @@
 #include "ItemTemplate.h"
 #include "SharedDefines.h"
 #include "SpellMgr.h"
+#include <atomic>
 #include <cmath>
 
 #include <set>
 #include <unordered_map>
 
 using namespace std;
+
+namespace
+{
+    std::atomic<
+        AuctionHouseBotProgression::PolicyProvider>
+        g_ahBotProgressionPolicyProvider{nullptr};
+}
+
+namespace AuctionHouseBotProgression
+{
+    void RegisterPolicyProvider(
+        PolicyProvider provider)
+    {
+        g_ahBotProgressionPolicyProvider.store(
+            provider,
+            std::memory_order_release);
+    }
+
+    bool HasPolicyProvider()
+    {
+        return
+            g_ahBotProgressionPolicyProvider.load(
+                std::memory_order_acquire) != nullptr;
+    }
+
+    bool TryGetPolicy(
+        Policy& policy)
+    {
+        PolicyProvider const provider =
+            g_ahBotProgressionPolicyProvider.load(
+                std::memory_order_acquire);
+
+        if (!provider)
+            return false;
+
+        return provider(policy);
+    }
+
+    std::uint16_t GetProfessionCap(
+        Policy const& policy,
+        std::uint32_t skillId)
+    {
+        switch (skillId)
+        {
+            case 164:
+            case 165:
+            case 171:
+            case 197:
+            case 202:
+            case 333:
+            case 755:
+            case 773:
+                return policy.craftingCap;
+
+            case 182:
+            case 186:
+            case 393:
+                return policy.gatheringCap;
+
+            case 129:
+            case 185:
+            case 356:
+                return policy.secondaryCap;
+
+            case 762:
+                return policy.ridingCap;
+
+            default:
+                return 0;
+        }
+    }
+}
 
 AuctionHouseBot::AuctionHouseBot() :
     debug_Out(false),
@@ -525,9 +598,12 @@ float AuctionHouseBot::GetRarityPricingMultiplier(
 float AuctionHouseBot::GetEndgamePricingMultiplier(
     ItemTemplate const* itemProto) const
 {
+    AuctionHouseBotProgression::Policy progressionPolicy;
+
     if (!itemProto ||
         !EndgamePricingEnabled ||
-        !sPhaseMgr.IsEnabled())
+        !AuctionHouseBotProgression::TryGetPolicy(
+            progressionPolicy))
     {
         return 1.0f;
     }
@@ -550,14 +626,8 @@ float AuctionHouseBot::GetEndgamePricingMultiplier(
     if (itemProto->RequiredLevel == 0)
         return 1.0f;
 
-    uint8 phase =
-        sPhaseMgr.GetActivePhase();
-
-    if (!sPhaseMgr.IsValidPhase(phase))
-        return 1.0f;
-
     uint32 maxLevel =
-        sPhaseMgr.GetMaxPlayerLevel();
+        progressionPolicy.maxPlayerLevel;
 
     if (itemProto->RequiredLevel > maxLevel)
         return 1.0f;
@@ -594,17 +664,17 @@ double AuctionHouseBot::GetCachedItemDropRate(
 
 float AuctionHouseBot::GetPhasePricingMultiplier() const
 {
+    AuctionHouseBotProgression::Policy progressionPolicy;
+
     if (!PhasePricingEnabled ||
-        !sPhaseMgr.IsEnabled())
+        !AuctionHouseBotProgression::TryGetPolicy(
+            progressionPolicy))
     {
         return 1.0f;
     }
 
     uint8 phase =
-        sPhaseMgr.GetActivePhase();
-
-    if (!sPhaseMgr.IsValidPhase(phase))
-        return 1.0f;
+        progressionPolicy.phase;
 
     auto itr =
         PhasePricingMultipliers.find(phase);
@@ -1284,24 +1354,16 @@ bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
         return false;
 
     /*
-     * Si Phase Progression está desactivado, AHBot conserva
-     * exactamente su comportamiento original.
+     * Without an authoritative progression policy AHBot keeps
+     * its original unrestricted behavior.
      */
-    if (!sPhaseMgr.IsEnabled())
+    AuctionHouseBotProgression::Policy phase;
+
+    if (!AuctionHouseBotProgression::TryGetPolicy(
+            phase))
+    {
         return true;
-
-    uint8 activePhase =
-        sPhaseMgr.GetActivePhase();
-
-    /*
-     * Protección durante startup antes de que PhaseMgr
-     * tenga las definiciones cargadas.
-     */
-    if (!sPhaseMgr.IsValidPhase(activePhase))
-        return true;
-
-    PhaseDefinition const& phase =
-        sPhaseMgr.GetActiveDefinition();
+    }
 
     /*
      * =====================================================
@@ -1380,7 +1442,8 @@ bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
         itemTemplate->RequiredSkillRank > 0)
     {
         uint16 professionCap =
-            sPhaseMgr.GetProfessionCap(
+            AuctionHouseBotProgression::GetProfessionCap(
+                phase,
                 itemTemplate->RequiredSkill);
 
         /*
@@ -1551,8 +1614,10 @@ bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
                         requiredRank;
 
                     embeddedProfessionCap =
-                        sPhaseMgr.GetProfessionCap(
-                            skillId);
+                        AuctionHouseBotProgression::
+                            GetProfessionCap(
+                                phase,
+                                skillId);
                 }
             }
         }
@@ -1739,13 +1804,11 @@ void AuctionHouseBot::PopulateItemCandidatesAndProportions()
      */
     PopulatePhaseUtilitySourceCache();
 
-    if (sPhaseMgr.IsEnabled() &&
-        sPhaseMgr.IsValidPhase(
-            sPhaseMgr.GetActivePhase()))
-    {
-        PhaseDefinition const& phase =
-            sPhaseMgr.GetActiveDefinition();
+    AuctionHouseBotProgression::Policy phase;
 
+    if (AuctionHouseBotProgression::TryGetPolicy(
+            phase))
+    {
         LOG_INFO(
             "module",
             "[AHBotPhase] Building candidate pool. "
