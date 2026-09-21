@@ -1354,15 +1354,21 @@ bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
         return false;
 
     /*
-     * Without an authoritative progression policy AHBot keeps
-     * its original unrestricted behavior.
+     * Standalone AHBot keeps its original unrestricted behavior.
+     *
+     * If an external authority registered a provider, however,
+     * absence of a policy means that authority is expected but
+     * is not ready. In that case fail closed instead of leaking
+     * future-phase items into the market.
      */
     AuctionHouseBotProgression::Policy phase;
 
     if (!AuctionHouseBotProgression::TryGetPolicy(
             phase))
     {
-        return true;
+        return
+            !AuctionHouseBotProgression::
+                HasPolicyProvider();
     }
 
     /*
@@ -1780,6 +1786,30 @@ bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
 
 void AuctionHouseBot::PopulateItemCandidatesAndProportions()
 {
+    /*
+     * Central safety barrier.
+     *
+     * No registered authority means standalone AHBot.
+     * A registered authority without a policy means GPA is
+     * expected but not ready, so do not alter the current
+     * candidate pool.
+     */
+    if (AuctionHouseBotProgression::HasPolicyProvider())
+    {
+        AuctionHouseBotProgression::Policy progressionPolicy;
+
+        if (!AuctionHouseBotProgression::TryGetPolicy(
+                progressionPolicy))
+        {
+            LOG_WARN(
+                "module",
+                "[AHBotPhase] Candidate-pool rebuild blocked: "
+                "authoritative progression policy unavailable.");
+
+            return;
+        }
+    }
+
     // Clear old list and rebuild it
     ItemCandidatesByItemClassAndQuality.clear();
 
@@ -3103,6 +3133,26 @@ void AuctionHouseBot::AddNewAuctionBuyerBotBid(std::vector<Player*> AHBPlayers, 
 
 void AuctionHouseBot::Update()
 {
+    /*
+     * Central safety barrier for every update caller,
+     * including commands and future integrations.
+     */
+    if (AuctionHouseBotProgression::HasPolicyProvider())
+    {
+        AuctionHouseBotProgression::Policy progressionPolicy;
+
+        if (!AuctionHouseBotProgression::TryGetPolicy(
+                progressionPolicy))
+        {
+            LOG_WARN(
+                "module",
+                "[AHBotPhase] Market update blocked: "
+                "authoritative progression policy unavailable.");
+
+            return;
+        }
+    }
+
     if (AHCharacters.empty() == true)
         return;
 

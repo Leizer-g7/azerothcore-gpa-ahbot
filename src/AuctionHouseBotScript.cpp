@@ -46,6 +46,22 @@ public:
 
         auctionbot->LoadSourceRarityPricing();
 
+        AuctionHouseBotProgression::Policy progressionPolicy;
+
+        if (AuctionHouseBotProgression::HasPolicyProvider() &&
+            !AuctionHouseBotProgression::TryGetPolicy(
+                progressionPolicy))
+        {
+            LOG_WARN(
+                "module",
+                "[AHBotPhase] Authoritative progression provider "
+                "registered but policy is not ready during startup. "
+                "Initial candidate-pool build deferred.");
+
+            HasPerformedStartup = true;
+            return;
+        }
+
         LOG_INFO("server.loading", "AuctionHouseBot: (Re)populating item candidate lists ...");
         auctionbot->PopulateItemCandidatesAndProportions();
         if (sConfigMgr->GetOption<bool>("AuctionHouseBot.AdvancedListingRules.UseDropRates.Enabled", false))
@@ -61,11 +77,13 @@ class AHBot_AuctionHouseScript : public AuctionHouseScript
 {
 private:
     uint8 LastKnownPhase;
+    bool AuthorityUnavailableLogged;
 
 public:
     AHBot_AuctionHouseScript() :
         AuctionHouseScript("AHBot_AuctionHouseScript"),
-        LastKnownPhase(0) { }
+        LastKnownPhase(0),
+        AuthorityUnavailableLogged(false) { }
 
     void OnBeforeAuctionHouseMgrSendAuctionSuccessfulMail(AuctionHouseMgr* /*auctionHouseMgr*/, AuctionEntry* /*auction*/, Player* owner, uint32& /*owner_accId*/, uint32& /*profit*/, bool& sendNotification, bool& updateAchievementCriteria, bool& /*sendMail*/) override
     {
@@ -150,8 +168,37 @@ public:
          */
         AuctionHouseBotProgression::Policy phase;
 
-        if (AuctionHouseBotProgression::TryGetPolicy(
+        if (!AuctionHouseBotProgression::TryGetPolicy(
                 phase))
+        {
+            if (AuctionHouseBotProgression::
+                    HasPolicyProvider())
+            {
+                if (!AuthorityUnavailableLogged)
+                {
+                    LOG_WARN(
+                        "module",
+                        "[AHBotPhase] Authoritative progression "
+                        "provider registered but policy unavailable. "
+                        "AHBot market update deferred.");
+
+                    AuthorityUnavailableLogged = true;
+                }
+
+                return;
+            }
+
+            /*
+             * No external authority registered:
+             * preserve standalone AHBot behavior.
+             */
+            AuthorityUnavailableLogged = false;
+            auctionbot->Update();
+            return;
+        }
+
+        AuthorityUnavailableLogged = false;
+
         {
             uint8 currentPhase = phase.phase;
 
