@@ -126,6 +126,16 @@ private:
     bool debug_Out;
     bool debug_Out_Filters;
 
+    /*
+     * Active AHBot listing limits per ItemID.
+     *
+     * Only Weapon/Armor use these maps for now.
+     * A value of 0 means unlimited.
+     */
+    bool DuplicateListingLimitEnabled = true;
+    std::map<uint32, uint32> DuplicateListingLimitWeaponByQuality;
+    std::map<uint32, uint32> DuplicateListingLimitArmorByQuality;
+
     bool SellingBotEnabled;
     bool BuyingBotEnabled;
     bool ReturnExpiredAuctionItemsToBot;
@@ -322,6 +332,55 @@ private:
     std::set<uint32> AdvancedListingRuleUseDropRatesArmorAffectedQualities;
     std::set<uint32> AdvancedListingRuleUseDropRatesRecipeAffectedQualities;
     float AdvancedListingRuleUseDropRatesMinDropRate;
+    /*
+     * Progressive / rarity pricing
+     */
+    /*
+     * Source rarity pricing.
+     *
+     * Represents how unusual the creature source itself is,
+     * independently from the item's drop percentage.
+     */
+    bool SourceRarityPricingEnabled = true;
+
+    float SourceRarityNormalMultiplier = 1.00f;
+    float SourceRarityEliteMultiplier = 1.10f;
+    float SourceRarityRareEliteMultiplier = 1.75f;
+    float SourceRarityRareMultiplier = 2.50f;
+    float SourceRarityWorldBossMultiplier = 3.00f;
+
+    std::unordered_map<uint32, float>
+        SourceRarityMultiplierByItemID;
+
+    bool RarityPricingEnabled = false;
+
+    float RarityPriceDrop5To10 = 1.10f;
+    float RarityPriceDrop2To5 = 1.25f;
+    float RarityPriceDrop1To2 = 1.50f;
+    float RarityPriceDrop05To1 = 2.00f;
+    float RarityPriceDrop02To05 = 2.75f;
+    float RarityPriceDrop01To02 = 3.50f;
+    float RarityPriceDrop005To01 = 4.50f;
+    float RarityPriceDrop002To005 = 6.00f;
+    float RarityPriceDropBelow002 = 8.00f;
+
+    bool EndgamePricingEnabled = true;
+    float EndgamePriceAtCap = 1.75f;
+    float EndgamePriceCapMinus1 = 1.60f;
+    float EndgamePriceCapMinus2To3 = 1.35f;
+    float EndgamePriceCapMinus4To5 = 1.15f;
+    bool PhasePricingEnabled = false;
+    std::map<uint8, float> PhasePricingMultipliers;
+
+    /*
+     * itemID:percentage
+     *
+     * 150 = x1.50
+     * 200 = x2.00
+     */
+    std::unordered_map<uint32, uint32>
+        SpecialItemPriceMultiplierPercentByItemID;
+
     std::unordered_set<uint32> QuestRewardItemIDs;
 
     FactionSpecificAuctionHouseConfig AllianceConfig;
@@ -332,6 +391,8 @@ private:
     uint32 LastSellCycleCount;
     int ActiveListMultipleItemID;
     int RemainingListMultipleCount;
+
+    uint32 GetDuplicateListingLimit(ItemTemplate const* itemProto) const;
 
     AuctionHouseBot();
 
@@ -359,6 +420,13 @@ public:
     const char* GetQualityName(ItemQualities quality);
     const char* GetCategoryName(ItemClass category);
     uint32 GetStackSizeForItem(ItemTemplate const* itemProto) const;
+    void LoadSourceRarityPricing();
+    float GetSourceRarityPricingMultiplier(uint32 itemId) const;
+    float GetRarityPricingMultiplier(ItemTemplate const* itemProto);
+    float GetEndgamePricingMultiplier(ItemTemplate const* itemProto) const;
+    double GetCachedItemDropRate(uint32 itemId) const;
+    float GetPhasePricingMultiplier() const;
+    float GetSpecialItemPriceMultiplier(uint32 itemId) const;
     void CalculateItemValue(ItemTemplate const* itemProto, uint64& outBidPrice, uint64& outBuyoutPrice);
     void PopulateItemDropChances();
     void PopulateItemDropChancesForCategoryAndQuality(ItemClass category, std::string qualities);
@@ -374,6 +442,8 @@ public:
     ItemTemplate const* GetProducedItemFromRecipe(ItemTemplate const* recipeItemTemplate);
     std::unordered_set<uint32> GetItemIDsProducedByRecipes();
     bool IsItemADisabledRecipeProducedClassSubclass(ItemTemplate const* itemTemplate);
+    bool IsPhaseMaterial(ItemTemplate const* itemTemplate);
+    bool IsItemAllowedForCurrentPhase(ItemTemplate const* itemTemplate);
     void PopulateItemCandidatesAndProportions();
     uint32 GetRandomItemIDForListing();
     void AddNewAuctions(std::vector<Player*> AHBPlayers, FactionSpecificAuctionHouseConfig* config);

@@ -21,6 +21,7 @@
 #include "ObjectMgr.h"
 #include "AuctionHouseMgr.h"
 #include "AuctionHouseBot.h"
+#include "../../mod-phase-progression/src/PhaseMgr.h"
 #include "AuctionHouseSearcher.h"
 #include "Config.h"
 #include "Player.h"
@@ -284,6 +285,358 @@ uint32 AuctionHouseBot::GetStackSizeForItem(ItemTemplate const* itemProto) const
         return 1;
 }
 
+
+
+void AuctionHouseBot::LoadSourceRarityPricing()
+{
+    SourceRarityMultiplierByItemID.clear();
+
+    if (!SourceRarityPricingEnabled)
+    {
+        LOG_INFO(
+            "module",
+            "[AHBotSourceRarity] Source rarity pricing disabled.");
+
+        return;
+    }
+
+    /*
+     * source_tier:
+     *
+     * 0 = Normal
+     * 1 = Elite
+     * 2 = Rare Elite
+     * 3 = Rare
+     * 4 = World Boss
+     *
+     * Important:
+     * creature_template.`rank` must be escaped because RANK
+     * is reserved by modern MySQL versions.
+     *
+     * If an item has multiple sources we use MIN(source_tier),
+     * meaning the most accessible source determines its premium.
+     */
+    QueryResult result = WorldDatabase.Query(R"SQL(
+        SELECT
+            sources.item_id,
+            MIN(sources.source_tier) AS source_tier
+        FROM
+        (
+            SELECT DISTINCT
+                clt.Item AS item_id,
+                CASE ct.`rank`
+                    WHEN 0 THEN 0
+                    WHEN 1 THEN 1
+                    WHEN 2 THEN 2
+                    WHEN 4 THEN 3
+                    WHEN 3 THEN 4
+                    ELSE 0
+                END AS source_tier
+            FROM creature_template ct
+            JOIN creature_loot_template clt
+                ON clt.Entry = ct.lootid
+            WHERE ct.lootid <> 0
+              AND clt.Reference = 0
+              AND clt.Item > 0
+
+            UNION ALL
+
+            SELECT DISTINCT
+                rlt.Item AS item_id,
+                CASE ct.`rank`
+                    WHEN 0 THEN 0
+                    WHEN 1 THEN 1
+                    WHEN 2 THEN 2
+                    WHEN 4 THEN 3
+                    WHEN 3 THEN 4
+                    ELSE 0
+                END AS source_tier
+            FROM creature_template ct
+            JOIN creature_loot_template clt
+                ON clt.Entry = ct.lootid
+            JOIN reference_loot_template rlt
+                ON rlt.Entry = clt.Reference
+            WHERE ct.lootid <> 0
+              AND clt.Reference > 0
+              AND rlt.Item > 0
+        ) sources
+        GROUP BY sources.item_id
+    )SQL");
+
+    if (!result)
+    {
+        LOG_ERROR(
+            "module",
+            "[AHBotSourceRarity] No source rarity rows were returned.");
+
+        return;
+    }
+
+    uint32 loaded = 0;
+
+    do
+    {
+        Field* fields = result->Fetch();
+
+        uint32 itemId =
+            fields[0].Get<uint32>();
+
+        uint32 sourceTier =
+            fields[1].Get<uint32>();
+
+        float multiplier = 1.0f;
+
+        switch (sourceTier)
+        {
+            case 0:
+                multiplier =
+                    SourceRarityNormalMultiplier;
+                break;
+
+            case 1:
+                multiplier =
+                    SourceRarityEliteMultiplier;
+                break;
+
+            case 2:
+                multiplier =
+                    SourceRarityRareEliteMultiplier;
+                break;
+
+            case 3:
+                multiplier =
+                    SourceRarityRareMultiplier;
+                break;
+
+            case 4:
+                multiplier =
+                    SourceRarityWorldBossMultiplier;
+                break;
+
+            default:
+                multiplier = 1.0f;
+                break;
+        }
+
+        SourceRarityMultiplierByItemID[itemId] =
+            multiplier;
+
+        ++loaded;
+
+    } while (result->NextRow());
+
+    LOG_INFO(
+        "module",
+        "[AHBotSourceRarity] Loaded source rarity for {} items.",
+        loaded);
+}
+
+float AuctionHouseBot::GetSourceRarityPricingMultiplier(
+    uint32 itemId) const
+{
+    if (!SourceRarityPricingEnabled)
+        return 1.0f;
+
+    auto itr =
+        SourceRarityMultiplierByItemID.find(itemId);
+
+    if (itr ==
+        SourceRarityMultiplierByItemID.end())
+    {
+        return 1.0f;
+    }
+
+    if (itr->second <= 0.0f)
+        return 1.0f;
+
+    return itr->second;
+}
+
+float AuctionHouseBot::GetRarityPricingMultiplier(
+    ItemTemplate const* itemProto)
+{
+    if (!itemProto ||
+        !RarityPricingEnabled ||
+        !AdvancedListingRuleUseDropRatesEnabled)
+    {
+        return 1.0f;
+    }
+
+    /*
+     * Solo aplicar a categorías/calidades que participan
+     * en AdvancedListingRules.UseDropRates.
+     */
+    if (!IsItemCategoryQualityInDBDropRatesConfig(itemProto))
+        return 1.0f;
+
+    /*
+     * Respetar excepciones del sistema original.
+     */
+    if (AdvancedListingRuleUseDropRatesExceptionItems.contains(
+            itemProto->ItemId))
+    {
+        return 1.0f;
+    }
+
+    auto itr =
+        CachedItemDropRates.find(itemProto->ItemId);
+
+    if (itr == CachedItemDropRates.end())
+        return 1.0f;
+
+    double dropRate = itr->second;
+
+    /*
+     * Drop rates están expresados en porcentaje:
+     * 1.0 = 1%
+     * 0.1 = 0.1%
+     */
+    if (dropRate >= 10.0)
+        return 1.0f;
+
+    if (dropRate >= 5.0)
+        return RarityPriceDrop5To10;
+
+    if (dropRate >= 2.0)
+        return RarityPriceDrop2To5;
+
+    if (dropRate >= 1.0)
+        return RarityPriceDrop1To2;
+
+    if (dropRate >= 0.5)
+        return RarityPriceDrop05To1;
+
+    if (dropRate >= 0.2)
+        return RarityPriceDrop02To05;
+
+    if (dropRate >= 0.1)
+        return RarityPriceDrop01To02;
+
+    if (dropRate >= 0.05)
+        return RarityPriceDrop005To01;
+
+    if (dropRate >= 0.02)
+        return RarityPriceDrop002To005;
+
+    return RarityPriceDropBelow002;
+}
+
+
+float AuctionHouseBot::GetEndgamePricingMultiplier(
+    ItemTemplate const* itemProto) const
+{
+    if (!itemProto ||
+        !EndgamePricingEnabled ||
+        !sPhaseMgr.IsEnabled())
+    {
+        return 1.0f;
+    }
+
+    /*
+     * Solamente gear real verde o superior.
+     *
+     * No afecta materiales, recetas, bolsas,
+     * consumibles, projectiles, etc.
+     */
+    if (itemProto->Class != ITEM_CLASS_WEAPON &&
+        itemProto->Class != ITEM_CLASS_ARMOR)
+    {
+        return 1.0f;
+    }
+
+    if (itemProto->Quality < ITEM_QUALITY_UNCOMMON)
+        return 1.0f;
+
+    if (itemProto->RequiredLevel == 0)
+        return 1.0f;
+
+    uint8 phase =
+        sPhaseMgr.GetActivePhase();
+
+    if (!sPhaseMgr.IsValidPhase(phase))
+        return 1.0f;
+
+    uint32 maxLevel =
+        sPhaseMgr.GetMaxPlayerLevel();
+
+    if (itemProto->RequiredLevel > maxLevel)
+        return 1.0f;
+
+    uint32 difference =
+        maxLevel - itemProto->RequiredLevel;
+
+    if (difference == 0)
+        return EndgamePriceAtCap;
+
+    if (difference == 1)
+        return EndgamePriceCapMinus1;
+
+    if (difference <= 3)
+        return EndgamePriceCapMinus2To3;
+
+    if (difference <= 5)
+        return EndgamePriceCapMinus4To5;
+
+    return 1.0f;
+}
+
+double AuctionHouseBot::GetCachedItemDropRate(
+    uint32 itemId) const
+{
+    auto itr =
+        CachedItemDropRates.find(itemId);
+
+    if (itr == CachedItemDropRates.end())
+        return 0.0;
+
+    return itr->second;
+}
+
+float AuctionHouseBot::GetPhasePricingMultiplier() const
+{
+    if (!PhasePricingEnabled ||
+        !sPhaseMgr.IsEnabled())
+    {
+        return 1.0f;
+    }
+
+    uint8 phase =
+        sPhaseMgr.GetActivePhase();
+
+    if (!sPhaseMgr.IsValidPhase(phase))
+        return 1.0f;
+
+    auto itr =
+        PhasePricingMultipliers.find(phase);
+
+    if (itr == PhasePricingMultipliers.end() ||
+        itr->second <= 0.0f)
+    {
+        return 1.0f;
+    }
+
+    return itr->second;
+}
+
+float AuctionHouseBot::GetSpecialItemPriceMultiplier(
+    uint32 itemId) const
+{
+    auto itr =
+        SpecialItemPriceMultiplierPercentByItemID.find(
+            itemId);
+
+    if (itr ==
+        SpecialItemPriceMultiplierPercentByItemID.end())
+    {
+        return 1.0f;
+    }
+
+    if (itr->second == 0)
+        return 1.0f;
+
+    return static_cast<float>(itr->second) / 100.0f;
+}
+
 void AuctionHouseBot::CalculateItemValue(ItemTemplate const* itemProto, uint64& outBidPrice, uint64& outBuyoutPrice)
 {
     if (CompleteItemValueOverrideEnabled == true)
@@ -433,6 +786,83 @@ void AuctionHouseBot::CalculateItemValue(ItemTemplate const* itemProto, uint64& 
     // Only apply item level multiplier if set, and no advanced pricing has been enabled
     if (itemLevelPriceMultplier > 0.0f && itemProto->ItemLevel > 0 && advancedPricingMultiplier == 1.0f)
         outBuyoutPrice *= itemProto->ItemLevel * itemLevelPriceMultplier;
+
+
+    /*
+     * =====================================================
+     * PROGRESSIVE RARITY PRICING
+     * =====================================================
+     */
+    float rarityPricingMultiplier =
+        GetRarityPricingMultiplier(itemProto);
+
+    float sourceRarityPricingMultiplier =
+        GetSourceRarityPricingMultiplier(
+            itemProto->ItemId);
+
+    float specialItemPriceMultiplier =
+        GetSpecialItemPriceMultiplier(
+            itemProto->ItemId);
+
+    float endgamePricingMultiplier =
+        GetEndgamePricingMultiplier(
+            itemProto);
+
+    float phasePricingMultiplier =
+        GetPhasePricingMultiplier();
+
+    if (rarityPricingMultiplier <= 0.0f)
+        rarityPricingMultiplier = 1.0f;
+
+    if (sourceRarityPricingMultiplier <= 0.0f)
+        sourceRarityPricingMultiplier = 1.0f;
+
+    if (specialItemPriceMultiplier <= 0.0f)
+        specialItemPriceMultiplier = 1.0f;
+
+    if (endgamePricingMultiplier <= 0.0f)
+        endgamePricingMultiplier = 1.0f;
+
+    if (phasePricingMultiplier <= 0.0f)
+        phasePricingMultiplier = 1.0f;
+
+    outBuyoutPrice *= rarityPricingMultiplier;
+    outBuyoutPrice *= sourceRarityPricingMultiplier;
+    outBuyoutPrice *= specialItemPriceMultiplier;
+    outBuyoutPrice *= endgamePricingMultiplier;
+    outBuyoutPrice *= phasePricingMultiplier;
+
+    if (debug_Out &&
+        (rarityPricingMultiplier != 1.0f ||
+         specialItemPriceMultiplier != 1.0f ||
+         phasePricingMultiplier != 1.0f))
+    {
+        double dropRate = 0.0;
+
+        auto dropItr =
+            CachedItemDropRates.find(
+                itemProto->ItemId);
+
+        if (dropItr !=
+            CachedItemDropRates.end())
+        {
+            dropRate = dropItr->second;
+        }
+
+        LOG_INFO(
+            "module",
+            "[AHBotPricing] Item={} DropRate={} "
+            "RarityMult={} SourceMult={} SpecialMult={} "
+            "EndgameMult={} PhaseMult={} Buyout={}",
+            itemProto->ItemId,
+            dropRate,
+            rarityPricingMultiplier,
+            sourceRarityPricingMultiplier,
+            specialItemPriceMultiplier,
+            endgamePricingMultiplier,
+            phasePricingMultiplier,
+            outBuyoutPrice);
+    }
 
     // Avoid price overflows
     if (outBuyoutPrice > MaxBuyoutPriceInCopper)
@@ -686,6 +1116,98 @@ static const std::unordered_set<uint32> professionSkills = {
     129   // First Aid
 };
 
+/*
+ * ============================================================
+ * PHASE UTILITY FILTER
+ * ============================================================
+ *
+ * Used for Consumable / Misc / Quest economic progression.
+ *
+ * For creature drops we cache the LOWEST creature level able
+ * to provide each item, following reference_loot_template
+ * recursively.
+ */
+static std::unordered_map<uint32, uint32>
+    phaseUtilityMinSourceLevelByItemID;
+
+static void PopulatePhaseUtilitySourceCache()
+{
+    phaseUtilityMinSourceLevelByItemID.clear();
+
+    /*
+     * This exact recursive query was validated against the
+     * current AzerothCore world DB before being added here.
+     *
+     * Depth is deliberately capped to avoid malformed/circular
+     * reference chains from becoming expensive.
+     */
+    QueryResult result = WorldDatabase.Query(R"SQL(
+        WITH RECURSIVE loot_tree AS
+        (
+            SELECT
+                ct.entry AS creature_entry,
+                ct.minlevel AS source_level,
+                clt.Item AS item_id,
+                clt.Reference AS reference_id,
+                0 AS depth
+            FROM creature_template ct
+            JOIN creature_loot_template clt
+                ON clt.Entry = ct.lootid
+            WHERE ct.lootid <> 0
+
+            UNION ALL
+
+            SELECT
+                lt.creature_entry,
+                lt.source_level,
+                rlt.Item AS item_id,
+                rlt.Reference AS reference_id,
+                lt.depth + 1
+            FROM loot_tree lt
+            JOIN reference_loot_template rlt
+                ON rlt.Entry = lt.reference_id
+            WHERE lt.reference_id > 0
+              AND lt.depth < 5
+        )
+        SELECT
+            item_id,
+            MIN(source_level) AS min_source_level
+        FROM loot_tree
+        WHERE item_id > 0
+        GROUP BY item_id
+    )SQL");
+
+    if (!result)
+    {
+        LOG_INFO(
+            "module",
+            "[AHBotPhaseUtility] No creature source rows loaded.");
+
+        return;
+    }
+
+    do
+    {
+        Field* fields = result->Fetch();
+
+        uint32 itemId =
+            fields[0].Get<uint32>();
+
+        uint32 minSourceLevel =
+            fields[1].Get<uint32>();
+
+        phaseUtilityMinSourceLevelByItemID[itemId] =
+            minSourceLevel;
+
+    } while (result->NextRow());
+
+    LOG_INFO(
+        "module",
+        "[AHBotPhaseUtility] Loaded source levels for {} items.",
+        phaseUtilityMinSourceLevelByItemID.size());
+}
+
+
 std::unordered_set<uint32> AuctionHouseBot::GetItemIDsProducedByRecipes()
 {
     std::unordered_set<uint32> recipeItemIDs;
@@ -734,6 +1256,463 @@ bool AuctionHouseBot::IsItemADisabledRecipeProducedClassSubclass(ItemTemplate co
     return true;
 }
 
+bool AuctionHouseBot::IsPhaseMaterial(
+    ItemTemplate const* itemTemplate)
+{
+    if (!itemTemplate)
+        return false;
+
+    /*
+     * Materias primas / componentes económicos.
+     *
+     * GEM se incluye porque las gemas sin cortar también
+     * forman parte de la economía de profesiones y no
+     * queremos gemas de expansiones futuras en fases bajas.
+     */
+    return
+        itemTemplate->Class == ITEM_CLASS_TRADE_GOODS ||
+        itemTemplate->Class == ITEM_CLASS_REAGENT ||
+        itemTemplate->Class == ITEM_CLASS_GEM ||
+        itemTemplate->Class == ITEM_CLASS_CONTAINER ||
+        itemTemplate->Class == ITEM_CLASS_PROJECTILE;
+}
+
+bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
+    ItemTemplate const* itemTemplate)
+{
+    if (!itemTemplate)
+        return false;
+
+    /*
+     * Si Phase Progression está desactivado, AHBot conserva
+     * exactamente su comportamiento original.
+     */
+    if (!sPhaseMgr.IsEnabled())
+        return true;
+
+    uint8 activePhase =
+        sPhaseMgr.GetActivePhase();
+
+    /*
+     * Protección durante startup antes de que PhaseMgr
+     * tenga las definiciones cargadas.
+     */
+    if (!sPhaseMgr.IsValidPhase(activePhase))
+        return true;
+
+    PhaseDefinition const& phase =
+        sPhaseMgr.GetActiveDefinition();
+
+    /*
+     * =====================================================
+     * 1. NIVEL DE JUGADOR
+     * =====================================================
+     *
+     * NO usamos ItemLevel para equipo.
+     *
+     * Si un personaje nivel 20 puede usar un objeto ilvl 35,
+     * ese objeto es perfectamente válido para fase 20.
+     */
+    if (itemTemplate->RequiredLevel > 0 &&
+        itemTemplate->RequiredLevel >
+            phase.maxPlayerLevel)
+    {
+        if (debug_Out_Filters)
+        {
+            LOG_INFO(
+                "module",
+                "[AHBotPhase] Item {} rejected: "
+                "RequiredLevel={} > PlayerMaxLevel={}.",
+                itemTemplate->ItemId,
+                itemTemplate->RequiredLevel,
+                static_cast<uint32>(
+                    phase.maxPlayerLevel));
+        }
+
+        return false;
+    }
+
+    /*
+     * Para recetas también comprobamos el nivel requerido
+     * por el objeto que producen.
+     */
+    if (itemTemplate->Class == ITEM_CLASS_RECIPE)
+    {
+        ItemTemplate const* producedItem =
+            GetProducedItemFromRecipe(itemTemplate);
+
+        if (producedItem &&
+            producedItem->RequiredLevel > 0 &&
+            producedItem->RequiredLevel >
+                phase.maxPlayerLevel)
+        {
+            if (debug_Out_Filters)
+            {
+                LOG_INFO(
+                    "module",
+                    "[AHBotPhase] Recipe {} rejected: "
+                    "produced item {} requires level {}, "
+                    "phase max is {}.",
+                    itemTemplate->ItemId,
+                    producedItem->ItemId,
+                    producedItem->RequiredLevel,
+                    static_cast<uint32>(
+                        phase.maxPlayerLevel));
+            }
+
+            return false;
+        }
+    }
+
+    /*
+     * =====================================================
+     * 2. PROFESIONES
+     * =====================================================
+     *
+     * Hasta el cap inclusive.
+     *
+     * Ejemplo:
+     * cap=150
+     * RequiredSkillRank=150 -> permitido
+     * RequiredSkillRank=151 -> bloqueado
+     */
+    if (itemTemplate->RequiredSkill > 0 &&
+        itemTemplate->RequiredSkillRank > 0)
+    {
+        uint16 professionCap =
+            sPhaseMgr.GetProfessionCap(
+                itemTemplate->RequiredSkill);
+
+        /*
+         * professionCap == 0 significa que PhaseProgression
+         * no administra ese SkillId concreto.
+         */
+        if (professionCap > 0 &&
+            itemTemplate->RequiredSkillRank >
+                professionCap)
+        {
+            if (debug_Out_Filters)
+            {
+                LOG_INFO(
+                    "module",
+                    "[AHBotPhase] Item {} rejected: "
+                    "Skill={} Rank={} > PhaseCap={}.",
+                    itemTemplate->ItemId,
+                    itemTemplate->RequiredSkill,
+                    itemTemplate->RequiredSkillRank,
+                    professionCap);
+            }
+
+            return false;
+        }
+    }
+
+    /*
+     * =====================================================
+     * 3. MATERIALES
+     * =====================================================
+     *
+     * ItemLevel solo se utiliza para materias primas.
+     *
+     * Nunca se compara este valor con BotGearMaxItemLevel.
+     */
+    if (IsPhaseMaterial(itemTemplate) &&
+        phase.auctionMaterialMaxItemLevel > 0 &&
+        itemTemplate->ItemLevel >
+            phase.auctionMaterialMaxItemLevel)
+    {
+        if (debug_Out_Filters)
+        {
+            LOG_INFO(
+                "module",
+                "[AHBotPhase] Material {} rejected: "
+                "ItemLevel={} > MaterialMaxItemLevel={}.",
+                itemTemplate->ItemId,
+                itemTemplate->ItemLevel,
+                phase.auctionMaterialMaxItemLevel);
+        }
+
+        return false;
+    }
+
+    /*
+     * =====================================================
+     * 4. CONSUMABLE / MISC / QUEST
+     * =====================================================
+     *
+     * These classes often have RequiredLevel=0 even when
+     * belonging to much later content.
+     *
+     * Priority:
+     *
+     * 1) Profession skill requirement embedded in item spell.
+     * 2) Minimum creature source level.
+     * 3) ItemLevel fallback.
+     * 4) Unknown Quest ilvl=1 stays hidden until phase 80.
+     */
+    bool isPhaseUtilityItem =
+        itemTemplate->Class == ITEM_CLASS_CONSUMABLE ||
+        itemTemplate->Class == ITEM_CLASS_MISC ||
+        itemTemplate->Class == ITEM_CLASS_QUEST;
+
+    if (isPhaseUtilityItem)
+    {
+        /*
+         * -------------------------------------------------
+         * PROFESSION REQUIREMENT FROM EMBEDDED SPELL
+         * -------------------------------------------------
+         *
+         * Enchant scrolls are the important example:
+         *
+         * ItemTemplate.RequiredSkill = 0
+         * but Spells[0].SpellId is the real enchant spell.
+         *
+         * SkillLineAbility gives us:
+         *   SkillLine
+         *   MinSkillLineRank
+         */
+        /*
+         * Profession mappings can contain auxiliary
+         * SkillLineAbility rows with MinSkillLineRank=0.
+         *
+         * Rank 0 is NOT useful for phase progression:
+         * treating it as a real requirement would allow
+         * high-level enchant scrolls such as Berserking.
+         *
+         * We therefore:
+         *
+         *   - ignore rank 0;
+         *   - keep the highest positive requirement found;
+         *   - if no positive requirement exists, leave
+         *     hasEmbeddedProfessionRequirement=false so the
+         *     ItemLevel fallback can decide.
+         */
+        bool hasEmbeddedProfessionRequirement = false;
+
+        uint32 embeddedProfessionSkill = 0;
+        uint32 embeddedProfessionRequiredRank = 0;
+        uint32 embeddedProfessionCap = 0;
+
+        for (uint8 spellIndex = 0;
+             spellIndex < MAX_ITEM_PROTO_SPELLS;
+             ++spellIndex)
+        {
+            int32 itemSpellId =
+                itemTemplate->Spells[spellIndex].SpellId;
+
+            if (itemSpellId <= 0)
+                continue;
+
+            SkillLineAbilityMapBounds skillBounds =
+                sSpellMgr->GetSkillLineAbilityMapBounds(
+                    static_cast<uint32>(itemSpellId));
+
+            for (SkillLineAbilityMap::const_iterator
+                     skillItr = skillBounds.first;
+                 skillItr != skillBounds.second;
+                 ++skillItr)
+            {
+                SkillLineAbilityEntry const* ability =
+                    skillItr->second;
+
+                if (!ability)
+                    continue;
+
+                uint32 skillId =
+                    ability->SkillLine;
+
+                if (professionSkills.find(skillId) ==
+                    professionSkills.end())
+                {
+                    continue;
+                }
+
+                uint32 requiredRank =
+                    ability->MinSkillLineRank;
+
+                /*
+                 * Do not trust zero-rank auxiliary mappings.
+                 * If all mappings are zero the normal
+                 * ItemLevel fallback will be used.
+                 */
+                if (requiredRank == 0)
+                    continue;
+
+                if (!hasEmbeddedProfessionRequirement ||
+                    requiredRank >
+                        embeddedProfessionRequiredRank)
+                {
+                    hasEmbeddedProfessionRequirement = true;
+
+                    embeddedProfessionSkill =
+                        skillId;
+
+                    embeddedProfessionRequiredRank =
+                        requiredRank;
+
+                    embeddedProfessionCap =
+                        sPhaseMgr.GetProfessionCap(
+                            skillId);
+                }
+            }
+        }
+
+        if (hasEmbeddedProfessionRequirement &&
+            embeddedProfessionRequiredRank >
+                embeddedProfessionCap)
+        {
+            if (debug_Out_Filters)
+            {
+                LOG_INFO(
+                    "module",
+                    "[AHBotPhaseUtility] Item {} rejected: "
+                    "profession skill {} requires {} "
+                    "but phase cap is {}.",
+                    itemTemplate->ItemId,
+                    embeddedProfessionSkill,
+                    embeddedProfessionRequiredRank,
+                    embeddedProfessionCap);
+            }
+
+            return false;
+        }
+
+        /*
+         * -------------------------------------------------
+         * CREATURE SOURCE LEVEL
+         * -------------------------------------------------
+         *
+         * Use the most accessible known creature source.
+         *
+         * +3 is intentional:
+         * expansion/dungeon/world bosses can be a few levels
+         * above the player cap (e.g. level 73 at level-70
+         * endgame).
+         */
+        auto sourceItr =
+            phaseUtilityMinSourceLevelByItemID.find(
+                itemTemplate->ItemId);
+
+        bool hasCreatureSource =
+            sourceItr !=
+                phaseUtilityMinSourceLevelByItemID.end();
+
+        if (hasCreatureSource)
+        {
+            uint32 maxAccessibleSourceLevel =
+                static_cast<uint32>(
+                    phase.maxPlayerLevel) + 3;
+
+            if (sourceItr->second >
+                maxAccessibleSourceLevel)
+            {
+                if (debug_Out_Filters)
+                {
+                    LOG_INFO(
+                        "module",
+                        "[AHBotPhaseUtility] Item {} rejected: "
+                        "MinSourceLevel={} > "
+                        "PhaseAccessibleSourceLevel={}.",
+                        itemTemplate->ItemId,
+                        sourceItr->second,
+                        maxAccessibleSourceLevel);
+                }
+
+                return false;
+            }
+        }
+
+        /*
+         * -------------------------------------------------
+         * ITEMLEVEL FALLBACK
+         * -------------------------------------------------
+         *
+         * A profession requirement is stronger evidence than
+         * ItemLevel. Therefore an enchant scroll whose real
+         * Enchanting requirement fits the phase is NOT rejected
+         * just because its scroll ItemLevel happens to be high.
+         *
+         * Quest items with a known creature source also trust
+         * that source rather than ItemLevel.
+         */
+        bool useItemLevelFallback = false;
+
+        if (itemTemplate->Class == ITEM_CLASS_CONSUMABLE)
+        {
+            useItemLevelFallback =
+                !hasEmbeddedProfessionRequirement;
+        }
+        else if (itemTemplate->Class == ITEM_CLASS_MISC)
+        {
+            useItemLevelFallback = true;
+        }
+        else if (itemTemplate->Class == ITEM_CLASS_QUEST)
+        {
+            useItemLevelFallback =
+                !hasCreatureSource &&
+                !hasEmbeddedProfessionRequirement;
+        }
+
+        if (useItemLevelFallback &&
+            itemTemplate->ItemLevel > 0 &&
+            itemTemplate->ItemLevel >
+                phase.maxPlayerLevel)
+        {
+            if (debug_Out_Filters)
+            {
+                LOG_INFO(
+                    "module",
+                    "[AHBotPhaseUtility] Item {} rejected: "
+                    "UtilityItemLevel={} > "
+                    "PlayerMaxLevel={}.",
+                    itemTemplate->ItemId,
+                    itemTemplate->ItemLevel,
+                    static_cast<uint32>(
+                        phase.maxPlayerLevel));
+            }
+
+            return false;
+        }
+
+        /*
+         * -------------------------------------------------
+         * UNKNOWN QUEST FALLBACK
+         * -------------------------------------------------
+         *
+         * Some expansion-era cards/decks have:
+         *
+         * RequiredLevel = 0
+         * ItemLevel     = 1
+         * no direct creature source
+         *
+         * There is no trustworthy phase signal for those.
+         * Keep them out until the final WotLK phase rather
+         * than leaking future content into early phases.
+         */
+        if (itemTemplate->Class == ITEM_CLASS_QUEST &&
+            !hasCreatureSource &&
+            !hasEmbeddedProfessionRequirement &&
+            itemTemplate->ItemLevel <= 1 &&
+            phase.phase < 80)
+        {
+            if (debug_Out_Filters)
+            {
+                LOG_INFO(
+                    "module",
+                    "[AHBotPhaseUtility] Item {} rejected: "
+                    "unknown Quest source with ItemLevel <= 1 "
+                    "before phase 80.",
+                    itemTemplate->ItemId);
+            }
+
+            return false;
+        }
+    }
+
+    return true;
+
+}
+
 void AuctionHouseBot::PopulateItemCandidatesAndProportions()
 {
     // Clear old list and rebuild it
@@ -754,12 +1733,45 @@ void AuctionHouseBot::PopulateItemCandidatesAndProportions()
     ItemIDsProducedByRecipes.clear();
     ItemIDsProducedByRecipes = GetItemIDsProducedByRecipes();
 
+    /*
+     * Source-level information used by the phase utility
+     * filter below.
+     */
+    PopulatePhaseUtilitySourceCache();
+
+    if (sPhaseMgr.IsEnabled() &&
+        sPhaseMgr.IsValidPhase(
+            sPhaseMgr.GetActivePhase()))
+    {
+        PhaseDefinition const& phase =
+            sPhaseMgr.GetActiveDefinition();
+
+        LOG_INFO(
+            "module",
+            "[AHBotPhase] Building candidate pool. "
+            "Phase={}, PlayerMaxLevel={}, "
+            "MaterialMaxItemLevel={}, "
+            "CraftingCap={}, GatheringCap={}, "
+            "SecondaryCap={}.",
+            static_cast<uint32>(phase.phase),
+            static_cast<uint32>(
+                phase.maxPlayerLevel),
+            phase.auctionMaterialMaxItemLevel,
+            phase.craftingCap,
+            phase.gatheringCap,
+            phase.secondaryCap);
+    }
+
     // Fill candidate item templates
     ItemTemplateContainer const* its = sObjectMgr->GetItemTemplateStore();
     for (ItemTemplateContainer::const_iterator itr = its->begin(); itr != its->end(); ++itr)
     {
         // Never store curBlock zero
         if (itr->second.ItemId == 0)
+            continue;
+
+        // Phase Progression economic restrictions
+        if (!IsItemAllowedForCurrentPhase(&itr->second))
             continue;
 
         // If there is an iLevel exception, honor it
@@ -995,6 +2007,46 @@ void AuctionHouseBot::PopulateItemCandidatesAndProportions()
     }
 }
 
+
+uint32 AuctionHouseBot::GetDuplicateListingLimit(
+    ItemTemplate const* itemProto) const
+{
+    if (!DuplicateListingLimitEnabled ||
+        !itemProto)
+    {
+        return 0;
+    }
+
+    std::map<uint32, uint32> const* limits = nullptr;
+
+    if (itemProto->Class == ITEM_CLASS_WEAPON)
+    {
+        limits =
+            &DuplicateListingLimitWeaponByQuality;
+    }
+    else if (itemProto->Class == ITEM_CLASS_ARMOR)
+    {
+        limits =
+            &DuplicateListingLimitArmorByQuality;
+    }
+    else
+    {
+        /*
+         * Trade goods, consumables, projectiles,
+         * recipes, etc. remain unlimited.
+         */
+        return 0;
+    }
+
+    auto itr =
+        limits->find(itemProto->Quality);
+
+    if (itr == limits->end())
+        return 0;
+
+    return itr->second;
+}
+
 uint32 AuctionHouseBot::GetRandomItemIDForListing()
 {
     // Start with a listing proportion
@@ -1040,6 +2092,50 @@ void AuctionHouseBot::AddNewAuctions(std::vector<Player*> AHBPlayers, FactionSpe
     if (!auctionHouse)
     {
         return;
+    }
+
+
+    /*
+     * =====================================================
+     * ACTIVE AHBOT LISTINGS BY ITEM ID
+     * =====================================================
+     *
+     * Count only auctions owned by AHBot characters.
+     * Player auctions do NOT consume the bot duplicate limit.
+     */
+    std::unordered_set<ObjectGuid::LowType>
+        ahBotOwnerGuids;
+
+    std::unordered_map<uint32, uint32>
+        activeBotListingsByItemID;
+
+    if (DuplicateListingLimitEnabled)
+    {
+        for (AuctionHouseBotCharacter const& character :
+             AHCharacters)
+        {
+            ahBotOwnerGuids.insert(
+                character.CharacterGUID);
+        }
+
+        for (auto const& auctionPair :
+             auctionHouse->GetAuctions())
+        {
+            AuctionEntry const* activeAuction =
+                auctionPair.second;
+
+            if (!activeAuction)
+                continue;
+
+            if (!ahBotOwnerGuids.contains(
+                    activeAuction->owner.GetCounter()))
+            {
+                continue;
+            }
+
+            ++activeBotListingsByItemID[
+                activeAuction->item_template];
+        }
     }
 
     uint32 currentAuctionItemListCount = auctionHouse->Getcount();
@@ -1146,6 +2242,56 @@ void AuctionHouseBot::AddNewAuctions(std::vector<Player*> AHBPlayers, FactionSpe
                 }
             }
 
+
+            /*
+             * =================================================
+             * DUPLICATE LISTING LIMIT
+             * =================================================
+             *
+             * This must run AFTER UseDropRates because that
+             * system may replace the originally selected ItemID.
+             */
+            uint32 duplicateLimit =
+                GetDuplicateListingLimit(prototype);
+
+            if (duplicateLimit > 0)
+            {
+                uint32 activeListings =
+                    activeBotListingsByItemID[itemID];
+
+                if (activeListings >= duplicateLimit)
+                {
+                    /*
+                     * Prevent ListMultipliedItemIDs from repeatedly
+                     * retrying an item that has already reached
+                     * its cap.
+                     */
+                    if (ActiveListMultipleItemID ==
+                        static_cast<int>(itemID))
+                    {
+                        ActiveListMultipleItemID = 0;
+                        RemainingListMultipleCount = 0;
+                    }
+
+                    if (debug_Out)
+                    {
+                        LOG_INFO(
+                            "module",
+                            "[AHBotDuplicates] House={} "
+                            "Item={} Quality={} "
+                            "Active={} Limit={} -> rejected.",
+                            config->GetAHID(),
+                            itemID,
+                            prototype->Quality,
+                            activeListings,
+                            duplicateLimit);
+                    }
+
+                    batchCount++;
+                    continue;
+                }
+            }
+
             Player* AHBplayer = AHBPlayers[urand(0, AHBPlayers.size() - 1)];
 
             Item* item = Item::CreateItem(itemID, 1, AHBplayer);
@@ -1193,6 +2339,16 @@ void AuctionHouseBot::AddNewAuctions(std::vector<Player*> AHBPlayers, FactionSpe
             sAuctionMgr->AddAItem(item);
             auctionHouse->AddAuction(auctionEntry);
             auctionEntry->SaveToDB(trans);
+
+            /*
+             * Keep the in-memory counter synchronized with
+             * auctions created during this same seller cycle.
+             */
+            if (duplicateLimit > 0)
+            {
+                ++activeBotListingsByItemID[itemID];
+            }
+
             itemsGenerated++;
             batchCount++;
         }
@@ -1244,6 +2400,9 @@ bool AuctionHouseBot::HandleAdvancedListingRuleUseDropRates(ItemTemplate const*&
 void AuctionHouseBot::PopulateItemDropChances()
 {
     InitializeAdvancedListingRuleUseDropRatesTiers();
+
+    // Reset completo para reloads y cambios de fase.
+    CachedItemDropRates.clear();
 
     if (!AdvancedListingRuleUseDropRatesWeaponEnabled &&
         !AdvancedListingRuleUseDropRatesArmorEnabled &&
@@ -1464,9 +2623,26 @@ void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass cat
     QueryResult objectsDropResult = WorldDatabase.Query(objectsDropString,
                                                         category, qualities,
                                                         category, qualities);
-    if (!directResult || !referenceResult || !danglingReferenceResult || !groupResult || !objectsDropResult)
+    /*
+     * A QueryResult vacío no significa necesariamente que el
+     * cálculo completo haya fallado. Algunas categorías/calidades
+     * simplemente no tienen drops en una de las fuentes consultadas.
+     *
+     * Antes AHBot abortaba TODO el cálculo si cualquiera de las
+     * cinco consultas no devolvía filas. Eso hacía perder drops
+     * perfectamente válidos encontrados en otra fuente.
+     */
+    if (!directResult &&
+        !referenceResult &&
+        !danglingReferenceResult &&
+        !groupResult &&
+        !objectsDropResult)
     {
-        LOG_ERROR("module", "AuctionHouseBot: PopulateItemDropChances() failed to query items' drop rates.");
+        LOG_ERROR(
+            "module",
+            "AuctionHouseBot: PopulateItemDropChances() "
+            "returned no drop-rate results from any source.");
+
         return;
     }
 
@@ -1501,11 +2677,23 @@ void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass cat
         } while (result->NextRow());
     };
 
-    parseResults(directResult, true);
-    parseResults(referenceResult, true);
-    parseResults(danglingReferenceResult, false);
-    parseResults(groupResult, true);
-    parseResults(objectsDropResult, true);
+    /*
+     * Procesar independientemente cada fuente disponible.
+     */
+    if (directResult)
+        parseResults(directResult, true);
+
+    if (referenceResult)
+        parseResults(referenceResult, true);
+
+    if (danglingReferenceResult)
+        parseResults(danglingReferenceResult, false);
+
+    if (groupResult)
+        parseResults(groupResult, true);
+
+    if (objectsDropResult)
+        parseResults(objectsDropResult, true);
 
     // Populate drop rates Tiers
     for (auto& [classID, qualityGroups] : ItemCandidatesByItemClassAndQuality)
@@ -1984,6 +3172,201 @@ void AuctionHouseBot::InitializeConfiguration()
     ParseNumberListToSet(AdvancedListingRuleUseDropRatesRecipeAffectedQualities, sConfigMgr->GetOption<std::string>("AuctionHouseBot.AdvancedListingRules.UseDropRates.Recipe.AffectedQualities", "2,3,4,5"), "AdvancedListingRules.UseDropRates.Recipe.AffectedQualities");
     AdvancedListingRuleUseDropRatesExceptionItems.clear();
     ParseNumberListToSet(AdvancedListingRuleUseDropRatesExceptionItems, sConfigMgr->GetOption<std::string>("AuctionHouseBot.AdvancedListingRules.UseDropRates.DisabledItemIDs", ""), "AdvancedListingRules.UseDropRates.DisabledItemIDs");
+
+
+    /*
+     * =====================================================
+     * SOURCE RARITY PRICING
+     * =====================================================
+     */
+    SourceRarityPricingEnabled =
+        sConfigMgr->GetOption<bool>(
+            "AuctionHouseBot.SourceRarityPricing.Enabled",
+            true);
+
+    SourceRarityNormalMultiplier =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.SourceRarityPricing.Normal",
+            1.00f);
+
+    SourceRarityEliteMultiplier =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.SourceRarityPricing.Elite",
+            1.10f);
+
+    SourceRarityRareEliteMultiplier =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.SourceRarityPricing.RareElite",
+            1.75f);
+
+    SourceRarityRareMultiplier =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.SourceRarityPricing.Rare",
+            2.50f);
+
+    SourceRarityWorldBossMultiplier =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.SourceRarityPricing.WorldBoss",
+            3.00f);
+
+    /*
+     * =====================================================
+     * RARITY PRICING
+     * =====================================================
+     */
+    RarityPricingEnabled =
+        sConfigMgr->GetOption<bool>(
+            "AuctionHouseBot.RarityPricing.Enabled",
+            true);
+
+    RarityPriceDrop5To10 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRate5To10",
+            1.10f);
+
+    RarityPriceDrop2To5 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRate2To5",
+            1.25f);
+
+    RarityPriceDrop1To2 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRate1To2",
+            1.50f);
+
+    RarityPriceDrop05To1 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRate0_5To1",
+            2.00f);
+
+    RarityPriceDrop02To05 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRate0_2To0_5",
+            2.75f);
+
+    RarityPriceDrop01To02 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRate0_1To0_2",
+            3.50f);
+
+    RarityPriceDrop005To01 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRate0_05To0_1",
+            4.50f);
+
+    RarityPriceDrop002To005 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRate0_02To0_05",
+            6.00f);
+
+    RarityPriceDropBelow002 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.RarityPricing.Multiplier.DropRateBelow0_02",
+            8.00f);
+
+    /*
+     * =====================================================
+     * PHASE PRICING
+     * =====================================================
+     */
+
+    /*
+     * =====================================================
+     * ENDGAME / PHASE-CAP PRICING
+     * =====================================================
+     *
+     * Premium para gear verde+ cuyo RequiredLevel está
+     * cerca del cap de la fase activa.
+     */
+    EndgamePricingEnabled =
+        sConfigMgr->GetOption<bool>(
+            "AuctionHouseBot.EndgamePricing.Enabled",
+            true);
+
+    EndgamePriceAtCap =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.EndgamePricing.AtCap",
+            1.75f);
+
+    EndgamePriceCapMinus1 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.EndgamePricing.CapMinus1",
+            1.60f);
+
+    EndgamePriceCapMinus2To3 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.EndgamePricing.CapMinus2To3",
+            1.35f);
+
+    EndgamePriceCapMinus4To5 =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.EndgamePricing.CapMinus4To5",
+            1.15f);
+
+    PhasePricingEnabled =
+        sConfigMgr->GetOption<bool>(
+            "AuctionHouseBot.PhasePricing.Enabled",
+            true);
+
+    PhasePricingMultipliers.clear();
+
+    PhasePricingMultipliers[20] =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.PhasePricing.Phase20Multiplier",
+            1.00f);
+
+    PhasePricingMultipliers[30] =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.PhasePricing.Phase30Multiplier",
+            1.05f);
+
+    PhasePricingMultipliers[40] =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.PhasePricing.Phase40Multiplier",
+            1.10f);
+
+    PhasePricingMultipliers[50] =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.PhasePricing.Phase50Multiplier",
+            1.15f);
+
+    PhasePricingMultipliers[60] =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.PhasePricing.Phase60Multiplier",
+            1.20f);
+
+    PhasePricingMultipliers[70] =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.PhasePricing.Phase70Multiplier",
+            1.30f);
+
+    PhasePricingMultipliers[80] =
+        sConfigMgr->GetOption<float>(
+            "AuctionHouseBot.PhasePricing.Phase80Multiplier",
+            1.40f);
+
+    /*
+     * Premium manual por objeto.
+     * Sintaxis itemID:percent.
+     *
+     * 1482:150 = Shadowfang x1.50 adicional.
+     */
+    SpecialItemPriceMultiplierPercentByItemID.clear();
+
+    AddItemValuePairsToItemIDMap(
+        SpecialItemPriceMultiplierPercentByItemID,
+        sConfigMgr->GetOption<std::string>(
+            "AuctionHouseBot.SpecialItemPriceMultiplier.Items",
+            ""));
+
+    LOG_INFO(
+        "module",
+        "[AHBotPricing] RarityPricing={}, "
+        "PhasePricing={}, SpecialPremiumItems={}.",
+        RarityPricingEnabled,
+        PhasePricingEnabled,
+        SpecialItemPriceMultiplierPercentByItemID.size());
+
     MaxBuyoutPriceInCopper = sConfigMgr->GetOption<uint32>("AuctionHouseBot.MaxBuyoutPriceInCopper", 1000000000);
     BuyoutVariationReducePercent = sConfigMgr->GetOption<float>("AuctionHouseBot.BuyoutVariationReducePercent", 0.15f);
     BuyoutVariationAddPercent = sConfigMgr->GetOption<float>("AuctionHouseBot.BuyoutVariationAddPercent", 0.25f);
@@ -2173,6 +3556,104 @@ void AuctionHouseBot::InitializeConfiguration()
     AdvancedPricingMiscJunkEnabled = sConfigMgr->GetOption<bool>("AuctionHouseBot.AdvancedPricing.Misc.Junk.Enabled", true);
     AdvancedPricingMiscMountEnabled = sConfigMgr->GetOption<bool>("AuctionHouseBot.AdvancedPricing.Misc.Mount.Enabled", true);
     AdvancedPricingMiscPetEnabled = sConfigMgr->GetOption<bool>("AuctionHouseBot.AdvancedPricing.Misc.Pet.Enabled", true);
+
+
+    /*
+     * =====================================================
+     * DUPLICATE LISTING LIMITS
+     * =====================================================
+     *
+     * Maximum simultaneous AHBot auctions for the same ItemID.
+     * 0 = unlimited.
+     */
+    DuplicateListingLimitEnabled =
+        sConfigMgr->GetOption<bool>(
+            "AuctionHouseBot.DuplicateListingLimit.Enabled",
+            true);
+
+    DuplicateListingLimitWeaponByQuality.clear();
+
+    DuplicateListingLimitWeaponByQuality[0] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Weapon.Poor",
+            4);
+
+    DuplicateListingLimitWeaponByQuality[1] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Weapon.Normal",
+            4);
+
+    DuplicateListingLimitWeaponByQuality[2] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Weapon.Uncommon",
+            3);
+
+    DuplicateListingLimitWeaponByQuality[3] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Weapon.Rare",
+            1);
+
+    DuplicateListingLimitWeaponByQuality[4] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Weapon.Epic",
+            1);
+
+    DuplicateListingLimitWeaponByQuality[5] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Weapon.Legendary",
+            1);
+
+    DuplicateListingLimitWeaponByQuality[6] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Weapon.Artifact",
+            1);
+
+    DuplicateListingLimitWeaponByQuality[7] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Weapon.Heirloom",
+            1);
+
+    DuplicateListingLimitArmorByQuality.clear();
+
+    DuplicateListingLimitArmorByQuality[0] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Armor.Poor",
+            4);
+
+    DuplicateListingLimitArmorByQuality[1] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Armor.Normal",
+            4);
+
+    DuplicateListingLimitArmorByQuality[2] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Armor.Uncommon",
+            3);
+
+    DuplicateListingLimitArmorByQuality[3] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Armor.Rare",
+            1);
+
+    DuplicateListingLimitArmorByQuality[4] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Armor.Epic",
+            1);
+
+    DuplicateListingLimitArmorByQuality[5] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Armor.Legendary",
+            1);
+
+    DuplicateListingLimitArmorByQuality[6] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Armor.Artifact",
+            1);
+
+    DuplicateListingLimitArmorByQuality[7] =
+        sConfigMgr->GetOption<uint32>(
+            "AuctionHouseBot.DuplicateListingLimit.Armor.Heirloom",
+            1);
 
     // Price minimums
     UseItemSellPriceIfHigherThanPriceMinimumCenterBase = sConfigMgr->GetOption<bool>("AuctionHouseBot.PriceMinimumCenterBase.UseItemSellPriceIfHigher", true);

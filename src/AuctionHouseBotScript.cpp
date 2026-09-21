@@ -5,8 +5,10 @@
 #include "Chat.h"
 #include "ScriptMgr.h"
 #include "AuctionHouseBot.h"
+#include "../../mod-phase-progression/src/PhaseMgr.h"
 #include "Log.h"
 #include "Mail.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "WorldSession.h"
 
@@ -42,6 +44,8 @@ public:
         if (!auctionbot->IsModuleEnabled())
             return;
 
+        auctionbot->LoadSourceRarityPricing();
+
         LOG_INFO("server.loading", "AuctionHouseBot: (Re)populating item candidate lists ...");
         auctionbot->PopulateItemCandidatesAndProportions();
         if (sConfigMgr->GetOption<bool>("AuctionHouseBot.AdvancedListingRules.UseDropRates.Enabled", false))
@@ -55,8 +59,13 @@ public:
 
 class AHBot_AuctionHouseScript : public AuctionHouseScript
 {
+private:
+    uint8 LastKnownPhase;
+
 public:
-    AHBot_AuctionHouseScript() : AuctionHouseScript("AHBot_AuctionHouseScript") { }
+    AHBot_AuctionHouseScript() :
+        AuctionHouseScript("AHBot_AuctionHouseScript"),
+        LastKnownPhase(0) { }
 
     void OnBeforeAuctionHouseMgrSendAuctionSuccessfulMail(AuctionHouseMgr* /*auctionHouseMgr*/, AuctionEntry* /*auction*/, Player* owner, uint32& /*owner_accId*/, uint32& /*profit*/, bool& sendNotification, bool& updateAchievementCriteria, bool& /*sendMail*/) override
     {
@@ -135,6 +144,71 @@ public:
 
     void OnBeforeAuctionHouseMgrUpdate() override
     {
+        /*
+         * Sincronización automática con avances y rollbacks.
+         */
+        if (sPhaseMgr.IsEnabled() &&
+            sPhaseMgr.IsValidPhase(
+                sPhaseMgr.GetActivePhase()))
+        {
+            uint8 currentPhase =
+                sPhaseMgr.GetActivePhase();
+
+            if (LastKnownPhase == 0)
+            {
+                LastKnownPhase = currentPhase;
+            }
+            else if (currentPhase != LastKnownPhase)
+            {
+                PhaseDefinition const& phase =
+                    sPhaseMgr.GetActiveDefinition();
+
+                LOG_INFO(
+                    "module",
+                    "[AHBotPhase] Phase changed {} -> {}. "
+                    "Rebuilding AHBot market. "
+                    "PlayerMaxLevel={}, "
+                    "MaterialMaxItemLevel={}.",
+                    static_cast<uint32>(
+                        LastKnownPhase),
+                    static_cast<uint32>(
+                        currentPhase),
+                    static_cast<uint32>(
+                        phase.maxPlayerLevel),
+                    phase.auctionMaterialMaxItemLevel);
+
+                /*
+                 * Solo vacía las subastas pertenecientes
+                 * a AuctionHouseBot.
+                 */
+                auctionbot->EmptyAuctionHouses();
+                auctionbot->CleanupExpiredAuctionItems();
+
+                /*
+                 * Reconstruir candidatos usando la nueva fase.
+                 */
+                auctionbot->
+                    PopulateItemCandidatesAndProportions();
+
+                if (sConfigMgr->GetOption<bool>(
+                        "AuctionHouseBot.AdvancedListingRules.UseDropRates.Enabled",
+                        false))
+                {
+                    auctionbot->PopulateQuestRewardItemIDs();
+                    auctionbot->PopulateItemDropChances();
+                }
+
+                LastKnownPhase = currentPhase;
+
+                LOG_INFO(
+                    "module",
+                    "[AHBotPhase] Market synchronized "
+                    "with phase {}.",
+                    static_cast<uint32>(
+                        currentPhase));
+            }
+        }
+
         auctionbot->Update();
     }
 };
@@ -183,7 +257,8 @@ public:
             {"update", HandleAHBotUpdateCommand, SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
             {"reload", HandleAHBotReloadCommand, SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
             {"empty",  HandleAHBotEmptyCommand,  SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
-            {"help",  HandleAHBotHelpCommand,  SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes}
+            {"price",  HandleAHBotPriceCommand,  SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
+            {"help",   HandleAHBotHelpCommand,   SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes}
         };
 
         static Acore::ChatCommands::ChatCommandTable commandTable = {
@@ -191,6 +266,101 @@ public:
         };
 
         return commandTable;
+    }
+
+
+    static bool HandleAHBotPriceCommand(
+        ChatHandler* handler,
+        char const* args)
+    {
+        if (!args || !*args)
+        {
+            handler->SendSysMessage(
+                "Usage: .ahbot price <itemId>");
+
+            return false;
+        }
+
+        uint32 itemId =
+            static_cast<uint32>(
+                std::strtoul(args, nullptr, 10));
+
+        ItemTemplate const* item =
+            sObjectMgr->GetItemTemplate(itemId);
+
+        if (!item)
+        {
+            handler->PSendSysMessage(
+                "AHBot: item {} not found.",
+                itemId);
+
+            return false;
+        }
+
+        uint64 bid = 0;
+        uint64 buyout = 0;
+
+        auctionbot->CalculateItemValue(
+            item,
+            bid,
+            buyout);
+
+        double dropRate =
+            auctionbot->GetCachedItemDropRate(
+                itemId);
+
+        float rarity =
+            auctionbot->
+                GetRarityPricingMultiplier(item);
+
+        float sourceRarity =
+            auctionbot->
+                GetSourceRarityPricingMultiplier(
+                    itemId);
+
+        float endgame =
+            auctionbot->
+                GetEndgamePricingMultiplier(item);
+
+        float special =
+            auctionbot->
+                GetSpecialItemPriceMultiplier(
+                    itemId);
+
+        float phase =
+            auctionbot->
+                GetPhasePricingMultiplier();
+
+        handler->PSendSysMessage(
+            "=== AHBot price debug [{}] {} ===",
+            itemId,
+            item->Name1);
+
+        handler->PSendSysMessage(
+            "RequiredLevel={} ItemLevel={} Quality={} "
+            "SellPrice={} copper",
+            item->RequiredLevel,
+            item->ItemLevel,
+            item->Quality,
+            item->SellPrice);
+
+        handler->PSendSysMessage(
+            "DropRate={}%% Rarity=x{} Source=x{} "
+            "Endgame=x{} Special=x{} Phase=x{}",
+            dropRate,
+            rarity,
+            sourceRarity,
+            endgame,
+            special,
+            phase);
+
+        handler->PSendSysMessage(
+            "Calculated unit Bid={} copper "
+            "Buyout={} copper",
+            bid,
+            buyout);
+
+        return true;
     }
 
     static bool HandleAHBotUpdateCommand(ChatHandler* handler, const char* /*args*/)
@@ -211,6 +381,7 @@ public:
         // Reload config file with isReload = true
         sConfigMgr->LoadModulesConfigs(true, false);
         AuctionHouseBot::instance()->InitializeConfiguration();
+        AuctionHouseBot::instance()->LoadSourceRarityPricing();
         AuctionHouseBot::instance()->PopulateItemCandidatesAndProportions();
 
         if (sConfigMgr->GetOption<bool>("AuctionHouseBot.AdvancedListingRules.UseDropRates.Enabled", true))
