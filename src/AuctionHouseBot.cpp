@@ -528,33 +528,42 @@ float AuctionHouseBot::GetSourceRarityPricingMultiplier(
 float AuctionHouseBot::GetRarityPricingMultiplier(
     ItemTemplate const* itemProto)
 {
-    if (!itemProto ||
-        !RarityPricingEnabled ||
-        !AdvancedListingRuleUseDropRatesEnabled)
+    if (!itemProto || !RarityPricingEnabled)
+        return 1.0f;
+
+    bool blueGear =
+        itemProto->Quality == 3 &&
+        (itemProto->Class == ITEM_CLASS_WEAPON ||
+         itemProto->Class == ITEM_CLASS_ARMOR);
+
+    // Conservar el comportamiento original para otras calidades.
+    if (!blueGear &&
+        (!AdvancedListingRuleUseDropRatesEnabled ||
+         !IsItemCategoryQualityInDBDropRatesConfig(itemProto)))
     {
         return 1.0f;
     }
 
-    /*
-     * Solo aplicar a categorías/calidades que participan
-     * en AdvancedListingRules.UseDropRates.
-     */
-    if (!IsItemCategoryQualityInDBDropRatesConfig(itemProto))
-        return 1.0f;
-
-    /*
-     * Respetar excepciones del sistema original.
-     */
     if (AdvancedListingRuleUseDropRatesExceptionItems.contains(
             itemProto->ItemId))
     {
         return 1.0f;
     }
 
-    auto itr =
-        CachedItemDropRates.find(itemProto->ItemId);
+    // Un precio especial sustituye la prima automatica
+    // de rareza para equipo azul, en lugar de acumularla.
+    if (blueGear &&
+        GetSpecialItemPriceMultiplier(itemProto->ItemId) != 1.0f)
+    {
+        return 1.0f;
+    }
 
-    if (itr == CachedItemDropRates.end())
+    auto const& rates =
+        blueGear ? CachedPricingDropRates : CachedItemDropRates;
+
+    auto itr = rates.find(itemProto->ItemId);
+
+    if (itr == rates.end())
         return 1.0f;
 
     double dropRate = itr->second;
@@ -653,9 +662,11 @@ float AuctionHouseBot::GetEndgamePricingMultiplier(
 double AuctionHouseBot::GetCachedItemDropRate(
     uint32 itemId) const
 {
-    auto itr =
-        CachedItemDropRates.find(itemId);
+    auto pricingItr = CachedPricingDropRates.find(itemId);
+    if (pricingItr != CachedPricingDropRates.end())
+        return pricingItr->second;
 
+    auto itr = CachedItemDropRates.find(itemId);
     if (itr == CachedItemDropRates.end())
         return 0.0;
 
@@ -907,17 +918,7 @@ void AuctionHouseBot::CalculateItemValue(ItemTemplate const* itemProto, uint64& 
          specialItemPriceMultiplier != 1.0f ||
          phasePricingMultiplier != 1.0f))
     {
-        double dropRate = 0.0;
-
-        auto dropItr =
-            CachedItemDropRates.find(
-                itemProto->ItemId);
-
-        if (dropItr !=
-            CachedItemDropRates.end())
-        {
-            dropRate = dropItr->second;
-        }
+        double dropRate = GetCachedItemDropRate(itemProto->ItemId);
 
         LOG_INFO(
             "module",
@@ -1200,6 +1201,53 @@ static const std::unordered_set<uint32> professionSkills = {
 static std::unordered_map<uint32, uint32>
     phaseUtilityMinSourceLevelByItemID;
 
+
+/*
+ * GPA phase-specific item exceptions.
+ * Cached once per candidate-pool rebuild.
+ */
+static std::unordered_map<uint32, uint32>
+    phaseMinimumByItemID;
+
+static bool phaseExceptionsCacheReady = false;
+
+static bool PopulatePhaseItemExceptionsCache()
+{
+    phaseExceptionsCacheReady = false;
+    phaseMinimumByItemID.clear();
+
+    QueryResult result = WorldDatabase.Query(
+        "SELECT item_id, minimum_phase, 0 AS control_row "
+        "FROM mod_ahbot_phase_item_exceptions "
+        "UNION ALL "
+        "SELECT 0, 0, 1");
+
+    if (!result)
+        return false;
+
+    do
+    {
+        Field* fields = result->Fetch();
+
+        if (fields[2].Get<uint32>() == 0)
+        {
+            phaseMinimumByItemID[
+                fields[0].Get<uint32>()
+            ] = fields[1].Get<uint32>();
+        }
+
+    } while (result->NextRow());
+
+    phaseExceptionsCacheReady = true;
+
+    LOG_INFO(
+        "module",
+        "[AHBotPhase] Loaded {} item exceptions.",
+        phaseMinimumByItemID.size());
+
+    return true;
+}
+
 static void PopulatePhaseUtilitySourceCache()
 {
     phaseUtilityMinSourceLevelByItemID.clear();
@@ -1277,6 +1325,67 @@ static void PopulatePhaseUtilitySourceCache()
         phaseUtilityMinSourceLevelByItemID.size());
 }
 
+
+
+static std::unordered_map<uint32, uint32>
+    enchantScrollRequiredRankBySpell;
+
+static bool PopulateEnchantScrollRequirementCache()
+{
+    QueryResult result = WorldDatabase.Query(R"SQL(
+        SELECT spell_id, MIN(required_rank) AS required_rank
+        FROM (
+            SELECT
+                spellid_2 AS spell_id,
+                RequiredSkillRank AS required_rank
+            FROM item_template
+            WHERE RequiredSkill = 333
+              AND RequiredSkillRank > 0
+              AND spelltrigger_2 = 6
+              AND spellid_2 > 0
+
+            UNION ALL
+
+            SELECT
+                SpellId AS spell_id,
+                ReqSkillRank AS required_rank
+            FROM trainer_spell
+            WHERE ReqSkillLine = 333
+              AND ReqSkillRank > 0
+              AND SpellId > 0
+        ) sources
+        GROUP BY spell_id
+
+        UNION ALL SELECT 0, 0
+    )SQL");
+
+    if (!result)
+        return false;
+
+    std::unordered_map<uint32, uint32> fresh;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 spellId = fields[0].Get<uint32>();
+
+        if (spellId > 0)
+            fresh[spellId] = fields[1].Get<uint32>();
+
+    } while (result->NextRow());
+
+    if (fresh.empty())
+        return false;
+
+    enchantScrollRequiredRankBySpell.swap(fresh);
+
+    LOG_INFO(
+        "module",
+        "[AHBotPhase] Loaded {} enchanting spell requirements.",
+        enchantScrollRequiredRankBySpell.size());
+
+    return true;
+}
 
 std::unordered_set<uint32> AuctionHouseBot::GetItemIDsProducedByRecipes()
 {
@@ -1370,6 +1479,24 @@ bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
             !AuctionHouseBotProgression::
                 HasPolicyProvider();
     }
+
+    /*
+     * GPA item exceptions.
+     * A missing cache fails closed while GPA is active.
+     */
+    if (!phaseExceptionsCacheReady)
+        return false;
+
+    auto exception = phaseMinimumByItemID.find(
+        itemTemplate->ItemId);
+
+    if (exception != phaseMinimumByItemID.end() &&
+        static_cast<uint32>(phase.phase) <
+            exception->second)
+    {
+        return false;
+    }
+
 
     /*
      * =====================================================
@@ -1524,6 +1651,12 @@ bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
         itemTemplate->Class == ITEM_CLASS_MISC ||
         itemTemplate->Class == ITEM_CLASS_QUEST;
 
+
+    bool const isEnchantScroll =
+        itemTemplate->Class == ITEM_CLASS_CONSUMABLE &&
+        itemTemplate->SubClass == 6 &&
+        itemTemplate->Name1.rfind("Scroll of Enchant", 0) == 0;
+
     if (isPhaseUtilityItem)
     {
         /*
@@ -1571,6 +1704,33 @@ bool AuctionHouseBot::IsItemAllowedForCurrentPhase(
 
             if (itemSpellId <= 0)
                 continue;
+
+
+            if (isEnchantScroll)
+            {
+                auto requirement =
+                    enchantScrollRequiredRankBySpell.find(
+                        static_cast<uint32>(itemSpellId));
+
+                if (requirement !=
+                        enchantScrollRequiredRankBySpell.end() &&
+                    (!hasEmbeddedProfessionRequirement ||
+                     requirement->second >
+                         embeddedProfessionRequiredRank))
+                {
+                    hasEmbeddedProfessionRequirement = true;
+                    embeddedProfessionSkill = 333;
+                    embeddedProfessionRequiredRank =
+                        requirement->second;
+                    embeddedProfessionCap =
+                        AuctionHouseBotProgression::
+                            GetProfessionCap(phase, 333);
+                }
+
+                // No reliable requirement: use ItemLevel fallback.
+                // The auxiliary DBC rank 1 is not sufficient.
+                continue;
+            }
 
             SkillLineAbilityMapBounds skillBounds =
                 sSpellMgr->GetSkillLineAbilityMapBounds(
@@ -1810,6 +1970,17 @@ void AuctionHouseBot::PopulateItemCandidatesAndProportions()
         }
     }
 
+
+    if (AuctionHouseBotProgression::HasPolicyProvider() &&
+        !PopulateEnchantScrollRequirementCache())
+    {
+        LOG_ERROR(
+            "module",
+            "[AHBotPhase] Enchant requirement cache unavailable. "
+            "Candidate-pool rebuild aborted.");
+        return;
+    }
+
     // Clear old list and rebuild it
     ItemCandidatesByItemClassAndQuality.clear();
 
@@ -1833,6 +2004,26 @@ void AuctionHouseBot::PopulateItemCandidatesAndProportions()
      * filter below.
      */
     PopulatePhaseUtilitySourceCache();
+    if (AuctionHouseBotProgression::HasPolicyProvider())
+    {
+        if (!PopulatePhaseItemExceptionsCache())
+        {
+            LOG_ERROR(
+                "module",
+                "[AHBotPhase] Exception cache unavailable. "
+                "Candidate-pool rebuild aborted.");
+
+            ItemCandidatesByItemClassAndQuality.clear();
+            return;
+        }
+    }
+    else
+    {
+        phaseExceptionsCacheReady = false;
+        phaseMinimumByItemID.clear();
+    }
+
+
 
     AuctionHouseBotProgression::Policy phase;
 
@@ -2496,6 +2687,7 @@ void AuctionHouseBot::PopulateItemDropChances()
 
     // Reset completo para reloads y cambios de fase.
     CachedItemDropRates.clear();
+    CachedPricingDropRates.clear();
 
     if (!AdvancedListingRuleUseDropRatesWeaponEnabled &&
         !AdvancedListingRuleUseDropRatesArmorEnabled &&
@@ -2524,6 +2716,15 @@ void AuctionHouseBot::PopulateItemDropChances()
         handleDropChancesForCategoryAndQuality(ITEM_CLASS_ARMOR, AdvancedListingRuleUseDropRatesArmorAffectedQualities);
     if (AdvancedListingRuleUseDropRatesRecipeEnabled)
         handleDropChancesForCategoryAndQuality(ITEM_CLASS_RECIPE, AdvancedListingRuleUseDropRatesRecipeAffectedQualities);
+
+    // V11: precios de equipo azul, independientes de la publicacion.
+    if (RarityPricingEnabled)
+    {
+        PopulateItemDropChancesForCategoryAndQuality(
+            ITEM_CLASS_WEAPON, "3", true);
+        PopulateItemDropChancesForCategoryAndQuality(
+            ITEM_CLASS_ARMOR, "3", true);
+    }
 
     // Erase item candidates that are not crafted, not quest rewards, and missing DB drop rate
     for (auto& [classID, qualityGroups] : ItemCandidatesByItemClassAndQuality)
@@ -2576,8 +2777,11 @@ void AuctionHouseBot::PopulateItemDropChances()
     }
 }
 
-void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass category, std::string qualities)
+void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass category, std::string qualities, bool pricingOnly)
 {
+    auto& dropRateCache = pricingOnly
+        ? CachedPricingDropRates
+        : CachedItemDropRates;
     if (qualities.empty())
     {
         LOG_ERROR("module", "AuctionHouseBot: PopulateItemDropChancesForCategoryAndQuality() qualities are not set. "
@@ -2739,8 +2943,8 @@ void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass cat
         return;
     }
 
-    // Add drop rate of all results to CachedItemDropRates 
-    auto parseResults = [this](QueryResult result, bool overwriteDropRate) 
+    // Add drop rate of all results to dropRateCache
+    auto parseResults = [this, &dropRateCache](QueryResult result, bool overwriteDropRate)
     {
         do {
             Field* fields = result->Fetch();
@@ -2752,7 +2956,7 @@ void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass cat
             if (IsItemQuestReward(itemID) || IsItemCrafted(itemID))
                 continue;
 
-            if (CachedItemDropRates.contains(itemID) && !overwriteDropRate)
+            if (dropRateCache.contains(itemID) && !overwriteDropRate)
                 continue;
 
             if (!fields[1].IsNull())
@@ -2764,8 +2968,8 @@ void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass cat
             double higherDropChance = (directDropChance > referenceDropChance) ? directDropChance : referenceDropChance;
             higherDropChance = (higherDropChance < AdvancedListingRuleUseDropRatesMinDropRate) ? AdvancedListingRuleUseDropRatesMinDropRate : higherDropChance;
 
-            if (CachedItemDropRates[itemID] < higherDropChance) 
-                CachedItemDropRates[itemID] = higherDropChance;
+            if (dropRateCache[itemID] < higherDropChance)
+                dropRateCache[itemID] = higherDropChance;
 
         } while (result->NextRow());
     };
@@ -2788,6 +2992,10 @@ void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass cat
     if (objectsDropResult)
         parseResults(objectsDropResult, true);
 
+    // El modo precios no modifica los tiers de publicacion.
+    if (pricingOnly)
+        return;
+
     // Populate drop rates Tiers
     for (auto& [classID, qualityGroups] : ItemCandidatesByItemClassAndQuality)
     {
@@ -2804,10 +3012,10 @@ void AuctionHouseBot::PopulateItemDropChancesForCategoryAndQuality(ItemClass cat
                     continue;
 
                 // Skip items that haven't been populated yet.
-                if (!CachedItemDropRates.contains(id))
+                if (!dropRateCache.contains(id))
                     continue;
 
-                double rate = CachedItemDropRates[id];
+                double rate = dropRateCache[id];
                 int tier = GetItemDropChanceTier(rate);
                 ItemTiersByClassAndQuality[proto->Class][proto->Quality][tier].push_back(id);
             }
@@ -3827,6 +4035,214 @@ void AuctionHouseBot::InitializeConfiguration()
     }
     NeutralConfig.SetMinItems(sConfigMgr->GetOption<uint32>("AuctionHouseBot.Neutral.MinItems", 15000));
     NeutralConfig.SetMaxItems(sConfigMgr->GetOption<uint32>("AuctionHouseBot.Neutral.MaxItems", 15000));
+}
+
+
+void AuctionHouseBot::RemoveAuctionsDisallowedByCurrentPhase(bool dryRun)
+{
+    AuctionHouseBotProgression::Policy phase;
+
+    if (!AuctionHouseBotProgression::TryGetPolicy(phase))
+    {
+        LOG_WARN(
+            "module",
+            "[AHBotPhaseCleanup] Skipped: authoritative policy unavailable.");
+        return;
+    }
+
+    if (!phaseExceptionsCacheReady)
+    {
+        LOG_WARN(
+            "module",
+            "[AHBotPhaseCleanup] Skipped: phase exception cache unavailable.");
+        return;
+    }
+
+    if (AHCharactersGUIDsForQuery.empty())
+    {
+        LOG_WARN(
+            "module",
+            "[AHBotPhaseCleanup] Skipped: no AHBot seller GUIDs configured.");
+        return;
+    }
+
+    std::string query =
+        "SELECT id, houseid FROM auctionhouse "
+        "WHERE itemowner IN ({})";
+
+    QueryResult result =
+        CharacterDatabase.Query(query, AHCharactersGUIDsForQuery);
+
+    uint32 scanned = 0;
+    uint32 rejected = 0;
+    uint32 removed = 0;
+    uint32 missing = 0;
+
+    // Initial safety limit for real cleanup operations.
+    // Dry-run mode continues auditing all auctions.
+    constexpr uint32 maxRemovals = 1;
+
+    if (!result)
+    {
+        LOG_INFO(
+            "module",
+            "[AHBotPhaseCleanup] No AHBot auctions found.");
+        return;
+    }
+
+    auto trans = CharacterDatabase.BeginTransaction();
+
+    do
+    {
+        Field* fields = result->Fetch();
+
+        uint32 auctionID = fields[0].Get<uint32>();
+        uint32 houseID = fields[1].Get<uint32>();
+
+        AuctionHouseObject* auctionHouse = nullptr;
+
+        switch (houseID)
+        {
+            case 2:
+                auctionHouse =
+                    sAuctionMgr->GetAuctionsMap(AllianceConfig.GetAHFID());
+                break;
+            case 6:
+                auctionHouse =
+                    sAuctionMgr->GetAuctionsMap(HordeConfig.GetAHFID());
+                break;
+            case 7:
+                auctionHouse =
+                    sAuctionMgr->GetAuctionsMap(NeutralConfig.GetAHFID());
+                break;
+        }
+
+        if (!auctionHouse)
+        {
+            ++missing;
+            continue;
+        }
+
+        AuctionEntry* auction = auctionHouse->GetAuction(auctionID);
+
+        if (!auction)
+        {
+            ++missing;
+            continue;
+        }
+
+        ItemTemplate const* itemTemplate =
+            sObjectMgr->GetItemTemplate(auction->item_template);
+
+        ++scanned;
+
+        // Missing templates require separate investigation.
+        // Never delete an auction solely because its template is absent.
+        if (!itemTemplate)
+        {
+            ++missing;
+
+            LOG_WARN(
+                "module",
+                "[AHBotPhaseCleanup] Missing item template. "
+                "Auction={}, Item={}.",
+                auctionID,
+                auction->item_template);
+
+            continue;
+        }
+
+        if (IsItemAllowedForCurrentPhase(itemTemplate))
+            continue;
+
+        ++rejected;
+
+        if (rejected <= 20)
+        {
+            LOG_INFO(
+                "module",
+                "[AHBotPhaseCleanup] {}: "
+                "Auction={}, Item={}, Phase={}.",
+                dryRun ? "DRY RUN" : "REMOVE",
+                auctionID,
+                auction->item_template,
+                static_cast<uint32>(phase.phase));
+        }
+
+        if (dryRun)
+            continue;
+
+        if (removed >= maxRemovals)
+        {
+            LOG_WARN(
+                "module",
+                "[AHBotPhaseCleanup] Safety limit reached. "
+                "MaxRemovals={}, Removed={}. "
+                "Stopping cleanup.",
+                maxRemovals,
+                removed);
+
+            break;
+        }
+
+        // Fail closed if the authoritative policy changes
+        // or becomes unavailable during cleanup.
+        AuctionHouseBotProgression::Policy currentPolicy;
+
+        if (!AuctionHouseBotProgression::TryGetPolicy(currentPolicy) ||
+            currentPolicy.phase != phase.phase ||
+            currentPolicy.maxPlayerLevel != phase.maxPlayerLevel ||
+            currentPolicy.auctionMaterialMaxItemLevel !=
+                phase.auctionMaterialMaxItemLevel ||
+            currentPolicy.craftingCap != phase.craftingCap ||
+            currentPolicy.gatheringCap != phase.gatheringCap ||
+            currentPolicy.secondaryCap != phase.secondaryCap ||
+            currentPolicy.ridingCap != phase.ridingCap)
+        {
+            LOG_ERROR(
+                "module",
+                "[AHBotPhaseCleanup] Aborted: authoritative "
+                "policy changed during cleanup.");
+
+            break;
+        }
+
+        // Refund any active bidder before removing the auction.
+        if (auction->bidder)
+            sAuctionMgr->SendAuctionCancelledToBidderMail(
+                auction, trans);
+
+        // Preserve existing AHBot item-return behavior.
+        if (ReturnExpiredAuctionItemsToBot)
+            sAuctionMgr->SendAuctionExpiredMail(
+                auction, trans, true, true);
+        else
+            Item::DeleteFromDB(
+                trans, auction->item_guid.GetCounter());
+
+        auction->DeleteFromDB(trans);
+
+        sAuctionMgr->RemoveAItem(auction->item_guid);
+        auctionHouse->RemoveAuction(auction);
+
+        ++removed;
+
+    } while (result->NextRow());
+
+    if (!dryRun)
+        CharacterDatabase.CommitTransaction(trans);
+
+    LOG_INFO(
+        "module",
+        "[AHBotPhaseCleanup] Scan complete. "
+        "DryRun={}, Phase={}, Scanned={}, "
+        "Rejected={}, Removed={}, Missing={}.",
+        dryRun,
+        static_cast<uint32>(phase.phase),
+        scanned,
+        rejected,
+        removed,
+        missing);
 }
 
 void AuctionHouseBot::EmptyAuctionHouses()

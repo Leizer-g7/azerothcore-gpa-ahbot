@@ -321,6 +321,7 @@ private:
     std::set<uint32> ListedItemIDExceptionItems;
     bool PreventOverpayingForVendorItems;
     std::unordered_map<uint32, double> CachedItemDropRates;
+    std::unordered_map<uint32, double> CachedPricingDropRates;
     std::vector<std::vector<std::vector<std::vector<uint32>>>> ItemTiersByClassAndQuality;  // [Classes][Qualities][Tiers] .. [17][7][configurable]
     std::map<double, int, std::greater<double>> DropRatesToTierMap;
     std::set<uint32> AdvancedListingRuleUseDropRatesExceptionItems;
@@ -409,6 +410,7 @@ public:
     bool IsModuleEnabled();
     void InitializeConfiguration();
     void EmptyAuctionHouses();
+    void RemoveAuctionsDisallowedByCurrentPhase(bool dryRun);
     uint32 GetRandomStackValue(std::string configKeyString, uint32 defaultValue);
     uint32 GetRandomStackIncrementValue(std::string configKeyString, uint32 defaultValue);
     void SetCyclesBetweenBuyOrSell();
@@ -429,7 +431,7 @@ public:
     float GetSpecialItemPriceMultiplier(uint32 itemId) const;
     void CalculateItemValue(ItemTemplate const* itemProto, uint64& outBidPrice, uint64& outBuyoutPrice);
     void PopulateItemDropChances();
-    void PopulateItemDropChancesForCategoryAndQuality(ItemClass category, std::string qualities);
+    void PopulateItemDropChancesForCategoryAndQuality(ItemClass category, std::string qualities, bool pricingOnly = false);
     void InitializeAdvancedListingRuleUseDropRatesTiers();
     void PopulateQuestRewardItemIDs();
     bool IsItemQuestReward(uint32 itemID);

@@ -217,6 +217,21 @@ public:
                 auctionbot->
                     PopulateItemCandidatesAndProportions();
 
+                // Audit existing AHBot auctions without removing them.
+                // The candidate-pool rebuild initializes phase caches.
+                auctionbot->
+                    RemoveAuctionsDisallowedByCurrentPhase(true);
+
+                // V11: cargar probabilidades en la primera fase GPA.
+                // No modifica ni elimina las subastas existentes.
+                if (sConfigMgr->GetOption<bool>(
+                        "AuctionHouseBot.AdvancedListingRules.UseDropRates.Enabled",
+                        false))
+                {
+                    auctionbot->PopulateQuestRewardItemIDs();
+                    auctionbot->PopulateItemDropChances();
+                }
+
                 LOG_INFO(
                     "module",
                     "[AHBotPhase] Initial authoritative "
@@ -241,11 +256,15 @@ public:
                         phase.maxPlayerLevel),
                     phase.auctionMaterialMaxItemLevel);
 
-                auctionbot->EmptyAuctionHouses();
-                auctionbot->CleanupExpiredAuctionItems();
-
+                // Rebuild the candidate pool for the new phase.
+                // Preserve existing auctions during dry-run validation.
                 auctionbot->
                     PopulateItemCandidatesAndProportions();
+
+                // Selectively audit auctions against the new phase.
+                // Do not remove auctions until explicitly enabled.
+                auctionbot->
+                    RemoveAuctionsDisallowedByCurrentPhase(true);
 
                 if (sConfigMgr->GetOption<bool>(
                         "AuctionHouseBot.AdvancedListingRules.UseDropRates.Enabled",
@@ -315,6 +334,7 @@ public:
             {"reload", HandleAHBotReloadCommand, SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
             {"empty",  HandleAHBotEmptyCommand,  SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
             {"price",  HandleAHBotPriceCommand,  SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
+            {"phasecheck", HandleAHBotPhaseCheckCommand, SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes},
             {"help",   HandleAHBotHelpCommand,   SEC_GAMEMASTER, Acore::ChatCommands::Console::Yes}
         };
 
@@ -325,6 +345,60 @@ public:
         return commandTable;
     }
 
+
+
+    static bool HandleAHBotPhaseCheckCommand(
+        ChatHandler* handler, char const* args)
+    {
+        if (!args || !*args)
+        {
+            handler->SendSysMessage("Usage: .ahbot phasecheck <itemId>");
+            return false;
+        }
+
+        char* end = nullptr;
+        unsigned long value = std::strtoul(args, &end, 10);
+
+        if (end == args || value == 0 || value > 4294967295UL)
+        {
+            handler->SendSysMessage("AHBotPhaseCheck: invalid item ID.");
+            return false;
+        }
+
+        while (*end == ' ' || *end == '\t')
+            ++end;
+
+        if (*end != '\0')
+        {
+            handler->SendSysMessage("AHBotPhaseCheck: unexpected arguments.");
+            return false;
+        }
+
+        uint32 itemId = static_cast<uint32>(value);
+        ItemTemplate const* item = sObjectMgr->GetItemTemplate(itemId);
+
+        if (!item)
+        {
+            handler->PSendSysMessage(
+                "AHBotPhaseCheck: item {} not found.", itemId);
+            return false;
+        }
+
+        bool allowed = auctionbot->IsItemAllowedForCurrentPhase(item);
+
+        handler->PSendSysMessage(
+            "AHBotPhaseCheck: Item={} Name={}", itemId, item->Name1);
+
+        handler->PSendSysMessage(
+            "AHBotPhaseCheck: RequiredLevel={} ItemLevel={}",
+            item->RequiredLevel, item->ItemLevel);
+
+        handler->PSendSysMessage(
+            "AHBotPhaseCheck: Allowed={}",
+            allowed ? "true" : "false");
+
+        return true;
+    }
 
     static bool HandleAHBotPriceCommand(
         ChatHandler* handler,
